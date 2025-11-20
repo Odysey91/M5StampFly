@@ -206,6 +206,7 @@ uint8_t Alt_flag       = 0;
 float Z_dot_ref = 0.0f;
 
 // 高度目標
+//Altitude target (in meters)
 const float Alt_ref0   = 0.5f;
 volatile float Alt_ref = Alt_ref0;
 
