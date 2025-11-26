@@ -340,10 +340,119 @@ void loop_400Hz(void) {
         if (rc_isconnected() == 0) Mode = AUTO_LANDING_MODE;
         // if (Range0flag == 20) Mode = AUTO_LANDING_MODE;
         if (OverG_flag == 1) Mode = PARKING_MODE;
-        if (Mode != OldMode) ahrs_reset();
+        
+        static int flight_substate = 0; // 0: Takeoff, 1: Forward, 2: Braking, 3: Turning
+        static float state_timer = 0.0f;
+        static float total_flight_timer = 0.0f;
+        static float obstacle_confirm_timer = 0.0f; // Nouveau timer pour filtrer le bruit
+
+        if (Mode != OldMode) {
+            ahrs_reset();
+            Thrust0 = 0.0f;
+            flight_substate = 0;
+            state_timer = 0.0f;
+            total_flight_timer = 0.0f;
+            obstacle_confirm_timer = 0.0f;
+        }
 
         // Get command
         get_command();
+
+        // Auto Flight Logic
+        Alt_flag = 1;
+        Alt_ref = 0.5f; // 50cm
+        
+        // Thrust Ramp up
+        float trim_duty = get_trim_duty(Voltage);
+        float base_thrust = trim_duty * 1.1f; 
+        if (flight_substate == 0 && state_timer < 1.0f) {
+             Thrust0 = base_thrust * (state_timer / 1.0f);
+        } else {
+             Thrust0 = base_thrust;
+        }
+        
+        // Reset RPY
+        Roll_angle_command = 0.0f;
+        Pitch_angle_command = 0.0f;
+        Yaw_angle_command = 0.0f;
+        Yaw_rate_reference = 0.0f;
+
+        state_timer += Interval_time;
+        total_flight_timer += Interval_time;
+
+        if (total_flight_timer > 40.0f) {
+            Mode = AUTO_LANDING_MODE;
+        }
+
+        switch (flight_substate) {
+            case 0: // Takeoff (0-2s)
+                // Compensation rotation décollage
+                if (state_timer < 1.0f) {
+                    Yaw_rate_reference = 40.0f * (PI / 180.0f);
+                }
+                
+                if (state_timer > 2.0f) {
+                    flight_substate = 1; // Go to Forward
+                    state_timer = 0.0f;
+                    obstacle_confirm_timer = 0.0f;
+                }
+                break;
+
+            case 1: // Forward
+                Pitch_angle_command = -0.1f; // Forward
+                
+                // Wall Detection avec FILTRE (Debounce)
+                // On vérifie si on est dans les conditions de détection
+                if (state_timer > 0.5f && Altitude2 > 0.3f && RangeFront < 800 && RangeFront > 20) {
+                    obstacle_confirm_timer += Interval_time; // On incrémente le timer si obstacle vu
+                } else {
+                    obstacle_confirm_timer = 0.0f; // On remet à zéro si l'obstacle disparait (c'était du bruit)
+                }
+
+                // Si l'obstacle est vu en continu pendant 0.1s (100ms), on valide
+                if (obstacle_confirm_timer > 0.1f) {
+                    flight_substate = 2; // Go to Braking
+                    state_timer = 0.0f;
+                    obstacle_confirm_timer = 0.0f;
+                }
+                break;
+
+            case 2: // Braking
+                if (state_timer < 0.5f) {
+                    Pitch_angle_command = 0.15f; // Brake (Backward)
+                } else {
+                    flight_substate = 3; // Go to Turning
+                    state_timer = 0.0f;
+                    obstacle_confirm_timer = 0.0f;
+                }
+                break;
+
+            case 3: // Turning until clear
+                // Turn right 45 deg/s
+                Yaw_rate_reference = 45.0f * (PI / 180.0f);
+                
+                // Même logique de filtre pour la sortie : il faut que la voie soit libre pendant un moment
+                if (state_timer > 0.5f) {
+                    if (RangeFront > 800) {
+                         obstacle_confirm_timer += Interval_time;
+                    } else {
+                         obstacle_confirm_timer = 0.0f;
+                    }
+
+                    // Si la voie est libre en continu pendant 0.2s, on repart
+                    if (obstacle_confirm_timer > 0.2f) {
+                        flight_substate = 1; // Back to Forward
+                        state_timer = 0.0f;
+                        obstacle_confirm_timer = 0.0f;
+                    }
+                }
+                break;
+        }
+
+        if (Control_mode == RATECONTROL) {
+             Roll_rate_reference = 0.0f;
+             Pitch_rate_reference = 0.0f;
+        }
 
         // Angle Control
         angle_control();
@@ -687,6 +796,11 @@ void get_command(void) {
     // Yaw control
     Yaw_rate_reference = 2.0f * PI * (Yaw_angle_command - Rudder_center);
 
+    if (Control_mode == RATECONTROL) {
+        Roll_rate_reference  = 240 * PI / 180 * Roll_angle_command;
+        Pitch_rate_reference = 240 * PI / 180 * Pitch_angle_command;
+    }
+
     // flip button check
     if (Flip_flag == 0 /*&& Throttle_control_mode == 0*/) {
         Flip_flag = get_flip_button();
@@ -814,7 +928,11 @@ uint8_t auto_landing(void) {
     // Thrust_command = Thrust_filtered.update(auto_throttle*BATTERY_VOLTAGE, Interval_time);
 
     // Get RPY command
-    Roll_angle_command = 0.4 * Stick[AILERON];
+    // Compensation d'inclinaison pour l'atterrissage (Trim)
+    // Ajustez landing_roll_trim : positif = penche à droite, négatif = penche à gauche
+    float landing_roll_trim = 0.12f; // Augmenté pour compenser davantage (~ +1 degré)
+
+    Roll_angle_command = 0.4 * Stick[AILERON] + landing_roll_trim;
     if (Roll_angle_command < -1.0f) Roll_angle_command = -1.0f;
     if (Roll_angle_command > 1.0f) Roll_angle_command = 1.0f;
     Pitch_angle_command = 0.4 * Stick[ELEVATOR];
@@ -870,8 +988,8 @@ void rate_control(void) {
             z_dot_err      = Z_dot_ref - Alt_velocity;
             Thrust_command = Thrust_filtered.update(
                 (Thrust0 + z_dot_pid.update(z_dot_err, Interval_time)) * BATTERY_VOLTAGE, Interval_time);
-            if (Thrust_command / BATTERY_VOLTAGE > Thrust0 * 1.15f) Thrust_command = BATTERY_VOLTAGE * Thrust0 * 1.15f;
-            if (Thrust_command / BATTERY_VOLTAGE < Thrust0 * 0.85f) Thrust_command = BATTERY_VOLTAGE * Thrust0 * 0.85f;
+            if (Thrust_command / BATTERY_VOLTAGE > Thrust0 * 1.80f) Thrust_command = BATTERY_VOLTAGE * Thrust0 * 1.80f;
+            if (Thrust_command / BATTERY_VOLTAGE < Thrust0 * 0.50f) Thrust_command = BATTERY_VOLTAGE * Thrust0 * 0.50f;
         } else if (Mode == AUTO_LANDING_MODE) {
             z_dot_err      = -0.15 - Alt_velocity;
             Thrust_command = Thrust_filtered.update(
