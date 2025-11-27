@@ -45,6 +45,8 @@
 #include "telemetry.hpp"
 #include "button.hpp"
 #include "buzzer.h"
+#include "tof.hpp"
+#include <math.h>
 
 // モータPWM出力Pinのアサイン
 // Motor PWM Pin
@@ -175,6 +177,32 @@ uint8_t Throttle_control_mode = 0;
 uint8_t Landing_state         = 0;
 uint8_t OladRange0flag        = 0;
 
+// for run_stair_mission
+enum MissionState {
+    MS_IDLE = 0,
+    MS_TAKEOFF,
+    MS_FORWARD,
+    MS_LAND
+};
+
+static MissionState mission_state = MS_IDLE;
+
+static float mission_yaw = 0.0f;
+static float saved_Elevator_center = 0.0f;
+static float saved_Rudder_center   = 0.0f;
+static bool centers_saved = false;
+
+static const float target_alt       = 0.50f;   // meters
+static const float forward_tilt_deg = 6.0f;    // small pitch forward
+static const float wall_stop_m      = 0.5f;   // 25cm front stop
+static const float yaw_kp           = 1.2f;
+
+static inline float wrap_pi(float a) {
+    while (a >  M_PI) a -= 2.0f * M_PI;
+    while (a < -M_PI) a += 2.0f * M_PI;
+    return a;
+}
+
 // for flip
 float FliRoll_rate_time          = 2.0;
 uint8_t Flip_flag                = 0;
@@ -206,7 +234,6 @@ uint8_t Alt_flag       = 0;
 float Z_dot_ref = 0.0f;
 
 // 高度目標
-//Altitude target (in meters)
 const float Alt_ref0   = 0.5f;
 volatile float Alt_ref = Alt_ref0;
 
@@ -218,6 +245,7 @@ void init_pwm();
 void control_init();
 void variable_init(void);
 void get_command(void);
+void get_command_mission(void);
 void angle_control(void);
 void rate_control(void);
 void output_data(void);
@@ -230,6 +258,7 @@ void reset_rate_control(void);
 void reset_angle_control(void);
 uint8_t auto_landing(void);
 float get_trim_duty(float voltage);
+void run_stair_mission(void);
 void flip(void);
 float get_rate_ref(float x);
 
@@ -305,11 +334,14 @@ void loop_400Hz(void) {
     sense_time       = sensor_read();
     uint32_t cs_time = micros();
 
+    // USBSerial.printf("RFD=%d, RGD=%d, FD=%d, GD=%d, fFD=%d, fGD=%d,\n", RangeFront, Range);
     // LED Drive
     led_drive();
     // if (Interval_time>0.006)USBSerial.printf("%9.6f\n\r", Interval_time);
     // USBSerial.printf("Mode=%d OverG=%d\n\r", Mode, OverG_flag);
     // Begin Mode select
+    // USBSerial.printf("Mode=%d, Mission Mode=%d, RF=%d, RB=%d \n" , Mode, mission_state, RangeFront, Range);
+
     if (Mode == INIT_MODE) {
         motor_stop();
         Elevator_center    = 0.0f;
@@ -341,120 +373,15 @@ void loop_400Hz(void) {
         if (rc_isconnected() == 0) Mode = AUTO_LANDING_MODE;
         // if (Range0flag == 20) Mode = AUTO_LANDING_MODE;
         if (OverG_flag == 1) Mode = PARKING_MODE;
-        
-        static int flight_substate = 0; // 0: Takeoff, 1: Forward, 2: Braking, 3: Turning
-        static float state_timer = 0.0f;
-        static float total_flight_timer = 0.0f;
-        static float obstacle_confirm_timer = 0.0f; // Nouveau timer pour filtrer le bruit
-
-        if (Mode != OldMode) {
-            ahrs_reset();
-            Thrust0 = 0.0f;
-            flight_substate = 0;
-            state_timer = 0.0f;
-            total_flight_timer = 0.0f;
-            obstacle_confirm_timer = 0.0f;
-        }
+        if (Mode != OldMode) ahrs_reset();
 
         // Get command
         get_command();
-
-        // Auto Flight Logic
-        Alt_flag = 1;
-        Alt_ref = 0.5f; // 50cm
-        
-        // Thrust Ramp up
-        float trim_duty = get_trim_duty(Voltage);
-        float base_thrust = trim_duty * 1.1f; 
-        if (flight_substate == 0 && state_timer < 1.0f) {
-             Thrust0 = base_thrust * (state_timer / 1.0f);
-        } else {
-             Thrust0 = base_thrust;
+        // flip button check
+        if (Flip_flag == 0 /*&& Throttle_control_mode == 0*/) {
+            Flip_flag = get_flip_button();
+            if (Flip_flag == 1) Mode = FLIP_MODE;
         }
-        
-        // Reset RPY
-        Roll_angle_command = 0.0f;
-        Pitch_angle_command = 0.0f;
-        Yaw_angle_command = 0.0f;
-        Yaw_rate_reference = 0.0f;
-
-        state_timer += Interval_time;
-        total_flight_timer += Interval_time;
-
-        if (total_flight_timer > 40.0f) {
-            Mode = AUTO_LANDING_MODE;
-        }
-
-        switch (flight_substate) {
-            case 0: // Takeoff (0-2s)
-                // Compensation rotation décollage
-                if (state_timer < 1.0f) {
-                    Yaw_rate_reference = 40.0f * (PI / 180.0f);
-                }
-                
-                if (state_timer > 2.0f) {
-                    flight_substate = 1; // Go to Forward
-                    state_timer = 0.0f;
-                    obstacle_confirm_timer = 0.0f;
-                }
-                break;
-
-            case 1: // Forward
-                Pitch_angle_command = -0.1f; // Forward
-                
-                // Wall Detection avec FILTRE (Debounce)
-                // On vérifie si on est dans les conditions de détection
-                if (state_timer > 0.5f && Altitude2 > 0.3f && RangeFront < 800 && RangeFront > 20) {
-                    obstacle_confirm_timer += Interval_time; // On incrémente le timer si obstacle vu
-                } else {
-                    obstacle_confirm_timer = 0.0f; // On remet à zéro si l'obstacle disparait (c'était du bruit)
-                }
-
-                // Si l'obstacle est vu en continu pendant 0.1s (100ms), on valide
-                if (obstacle_confirm_timer > 0.1f) {
-                    flight_substate = 2; // Go to Braking
-                    state_timer = 0.0f;
-                    obstacle_confirm_timer = 0.0f;
-                }
-                break;
-
-            case 2: // Braking
-                if (state_timer < 0.5f) {
-                    Pitch_angle_command = 0.15f; // Brake (Backward)
-                } else {
-                    flight_substate = 3; // Go to Turning
-                    state_timer = 0.0f;
-                    obstacle_confirm_timer = 0.0f;
-                }
-                break;
-
-            case 3: // Turning until clear
-                // Turn right 45 deg/s
-                Yaw_rate_reference = 45.0f * (PI / 180.0f);
-                
-                // Même logique de filtre pour la sortie : il faut que la voie soit libre pendant un moment
-                if (state_timer > 0.5f) {
-                    if (RangeFront > 800) {
-                         obstacle_confirm_timer += Interval_time;
-                    } else {
-                         obstacle_confirm_timer = 0.0f;
-                    }
-
-                    // Si la voie est libre en continu pendant 0.2s, on repart
-                    if (obstacle_confirm_timer > 0.2f) {
-                        flight_substate = 1; // Back to Forward
-                        state_timer = 0.0f;
-                        obstacle_confirm_timer = 0.0f;
-                    }
-                }
-                break;
-        }
-
-        if (Control_mode == RATECONTROL) {
-             Roll_rate_reference = 0.0f;
-             Pitch_rate_reference = 0.0f;
-        }
-
         // Angle Control
         angle_control();
 
@@ -462,6 +389,33 @@ void loop_400Hz(void) {
         rate_control();
     } else if (Mode == FLIP_MODE) {
         flip();
+    } else if (Mode == MISSION_MODE) {
+
+        // FIRST ARM THE MOTORS — same logic as FLIGHT_MODE
+        Control_period = Interval_time;
+
+        //USBSerial.printf("Thrust0 = %.3f  Thrust_command = %.3f  Alt_flag=%d  Voltage=%.2f\n", Thrust0, Thrust_command, Alt_flag, Voltage);
+        if (rc_isconnected() == 0)    { Mode = AUTO_LANDING_MODE; return; }
+        if (OverG_flag == 1)          { Mode = PARKING_MODE;     return; }
+
+        
+        if (Mode != OldMode) {
+            ahrs_reset();
+            Thrust0 = 0.0f;
+        }
+
+        get_command_mission();
+
+        Alt_flag = 1;
+        // Run MISSION
+        run_stair_mission();
+
+        // Stabilization always ON
+        angle_control();
+        rate_control();
+
+        return;
+
     } else if (Mode == PARKING_MODE) {
         // Judge Mode change
         if (judge_mode_change() == 1) {
@@ -477,7 +431,6 @@ void loop_400Hz(void) {
             }
             last_ahrs_reset_flag = ahrs_reset_flag;
         }
-
         // Parking
         motor_stop();
         OverG_flag = 0;
@@ -500,6 +453,14 @@ void loop_400Hz(void) {
         Duty_rr.reset();
         Duty_rl.reset();
         // if(Mode != OldMode)ahrs_reset();
+
+        if (get_flip_button() == 1) {
+            USBSerial.println("[MISSION] Start command received in PARKING_MODE");
+            mission_state = MS_IDLE;      // reset mission state machine
+            Mode = MISSION_MODE;          // switch to mission mode
+            return;
+        }
+
     } else if (Mode == AUTO_LANDING_MODE) {
         if (auto_landing() == 1) Mode = PARKING_MODE;
         if (judge_mode_change() == 1) Mode = PARKING_MODE;
@@ -519,6 +480,58 @@ void loop_400Hz(void) {
     Dt_time          = ce_time - cs_time;
     OldMode          = Mode;  // Memory now mode
     // End of Loop_400Hz function
+}
+
+void run_stair_mission() {
+
+    // ---- Mission state machine ----
+    switch (mission_state) {
+
+        // 1) Wait on ground
+        case MS_IDLE:
+            Roll_angle_command = 0.0f;
+            Pitch_angle_command = 0.0f;
+            Yaw_angle_command = 0.0f;
+            Yaw_rate_reference = 0.0f;
+            USBSerial.println("[MISSION] Start on ground");
+            mission_state = MS_TAKEOFF;
+            break;
+
+        // 2) Auto-takeoff to 50 cm using built-in altitude controller
+        case MS_TAKEOFF:
+            Alt_ref  = 0.5f;
+            Pitch_angle_command = 0.0f;
+            if (Range > 450) {    // reached ~50cm
+                USBSerial.println("[MISSION] Reached 50cm");
+                mission_state = MS_FORWARD;
+            }
+            break;
+
+        // 3) Move forward while keeping 50 cm altitude  
+        case MS_FORWARD:
+
+            // Slight forward pitch (built-in angle PID)
+            //Pitch_angle_command = 6.0f * (PI/180.0f) / 0.5f;
+            Alt_ref  = 0.5f;
+            Pitch_angle_command = -0.05f;
+
+            // Stop when wall detected
+            if (RangeFront > 20 && RangeFront < 1000) {   // < 50 cm
+                USBSerial.println("[MISSION] Wall detected → landing");
+                mission_state = MS_LAND;
+            }
+            break;
+
+        // 4) Auto landing using existing auto-landing module
+        case MS_LAND:
+            Roll_angle_command = 0.0f;
+            Pitch_angle_command = 0.0f;
+            Yaw_angle_command = 0.0f;
+            Yaw_rate_reference = 0.0f;
+            Mode = AUTO_LANDING_MODE;
+            USBSerial.println("[MISSION] Auto landing...");
+            break;
+    }
 }
 
 void flip(void) {
@@ -724,6 +737,42 @@ float get_rate_ref(float x) {
     return ref;
 }
 
+void get_command_mission(void) {
+    static float auto_throttle  = 0.0f;
+    static float old_alt        = 0.0;
+    float th, thlo;
+    float throttle_limit = 0.7;
+    float thrust_max;
+
+    Throttle_control_mode = 1;   // Force AUTO altitude
+
+    if (Throttle_control_mode == 1) {
+        // Auto Throttle Altitude Control
+        Alt_flag = 1;
+        if (Auto_takeoff_counter < 500) {
+            Thrust0 = (float)Auto_takeoff_counter / 1000.0;
+            if (Thrust0 > get_trim_duty(3.8)) Thrust0 = get_trim_duty(3.8);
+            Auto_takeoff_counter++;
+        } else if (Auto_takeoff_counter < 1000) {
+            Thrust0 = (float)Auto_takeoff_counter / 1000.0;
+            if (Thrust0 > get_trim_duty(Voltage)) Thrust0 = get_trim_duty(Voltage);
+            Auto_takeoff_counter++;
+        } else
+            Thrust0 = get_trim_duty(Voltage);
+
+        // Get Altitude ref
+        if ((-0.2 < thlo) && (thlo < 0.2)) thlo = 0.0f;  // 不感帯
+        Alt_ref = Alt_ref + thlo * 0.001;
+        if (Alt_ref > ALT_REF_MAX) Alt_ref = ALT_REF_MAX;
+        if (Alt_ref < ALT_REF_MIN) Alt_ref = ALT_REF_MIN;
+        if ((Range0flag > OladRange0flag) || (Range0flag == RNAGE0FLAG_MAX)) {
+            Thrust0        = Thrust0 - 0.02;
+            OladRange0flag = Range0flag;
+        }
+        Thrust_command = Thrust0 * BATTERY_VOLTAGE;
+    }
+}
+
 void get_command(void) {
     static uint16_t stick_count = 0;
     static float auto_throttle  = 0.0f;
@@ -743,7 +792,7 @@ void get_command(void) {
     // Thrust control
     thlo = Stick[THROTTLE];
     // thlo = thlo/throttle_limit;
-
+    
     if (Throttle_control_mode == 0) {
         // Manual Throttle
         if (thlo < 0.0) thlo = 0.0;
@@ -797,102 +846,7 @@ void get_command(void) {
     // Yaw control
     Yaw_rate_reference = 2.0f * PI * (Yaw_angle_command - Rudder_center);
 
-    if (Control_mode == RATECONTROL) {
-        Roll_rate_reference  = 240 * PI / 180 * Roll_angle_command;
-        Pitch_rate_reference = 240 * PI / 180 * Pitch_angle_command;
-    }
-
-    // flip button check
-    if (Flip_flag == 0 /*&& Throttle_control_mode == 0*/) {
-        Flip_flag = get_flip_button();
-        if (Flip_flag == 1) Mode = FLIP_MODE;
-    }
 }
-
-#if 0
-float get_trim_duty(float voltage) {
-    return -0.2448f * voltage + 1.5892f;
-}
-
-void get_command(void) {
-    static uint16_t stick_count = 0;
-    static float auto_throttle  = 0.0f;
-    static float old_alt        = 0.0;
-    float th, thlo;
-    float throttle_limit = 0.7;
-    float thrust_max;
-
-    Control_mode = Stick[CONTROLMODE];
-    if ((uint8_t)Stick[ALTCONTROLMODE] == AUTO_ALT)
-        Throttle_control_mode = 1;
-    else if ((uint8_t)Stick[ALTCONTROLMODE] == MANUAL_ALT)
-        Throttle_control_mode = 0;
-    else
-        Throttle_control_mode = 0;
-
-    // Thrust control
-    thlo = Stick[THROTTLE];
-    // thlo = thlo/throttle_limit;
-
-    if (Throttle_control_mode == 0) {
-        // Manual Throttle
-        if (thlo < 0.0) thlo = 0.0;
-        if (thlo > 1.0f) thlo = 1.0f;
-        if ((-0.2 < thlo) && (thlo < 0.2)) thlo = 0.0f;  // 不感帯
-        // Throttle curve conversion　スロットルカーブ補正
-        th             = (4.13e-3 + 3.3f * thlo - 5.44f * thlo * thlo + 3.13f * thlo * thlo * thlo) * BATTERY_VOLTAGE;
-        Thrust_command = Thrust_filtered.update(th, Interval_time);
-    } else if (Throttle_control_mode == 1) {
-        // Auto Throttle Altitude Control
-        Alt_flag = 1;
-        if (Auto_takeoff_counter < 500) {
-            Thrust0 = (float)Auto_takeoff_counter / 1000.0;
-            if (Thrust0 > get_trim_duty(3.8)) Thrust0 = get_trim_duty(3.8);
-            Auto_takeoff_counter++;
-        } else if (Auto_takeoff_counter < 1000) {
-            Thrust0 = (float)Auto_takeoff_counter / 1000.0;
-            if (Thrust0 > get_trim_duty(Voltage)) Thrust0 = get_trim_duty(Voltage);
-            Auto_takeoff_counter++;
-        } else
-            Thrust0 = get_trim_duty(Voltage);
-
-        // Get Altitude ref
-        if ((-0.2 < thlo) && (thlo < 0.2)) thlo = 0.0f;  // 不感帯
-        Alt_ref = Alt_ref + thlo * 0.001;
-        if (Alt_ref > ALT_REF_MAX) Alt_ref = ALT_REF_MAX;
-        if (Alt_ref < ALT_REF_MIN) Alt_ref = ALT_REF_MIN;
-        if ((Range0flag > OladRange0flag) || (Range0flag == RNAGE0FLAG_MAX)) {
-            Thrust0        = Thrust0 - 0.02;
-            OladRange0flag = Range0flag;
-        }
-        Thrust_command = Thrust0 * BATTERY_VOLTAGE;
-    }
-
-    Roll_angle_command = 0.4 * Stick[AILERON];
-    if (Roll_angle_command < -1.0f) Roll_angle_command = -1.0f;
-    if (Roll_angle_command > 1.0f) Roll_angle_command = 1.0f;
-    Pitch_angle_command = 0.4 * Stick[ELEVATOR];
-    if (Pitch_angle_command < -1.0f) Pitch_angle_command = -1.0f;
-    if (Pitch_angle_command > 1.0f) Pitch_angle_command = 1.0f;
-
-    Yaw_angle_command = Stick[RUDDER];
-    if (Yaw_angle_command < -1.0f) Yaw_angle_command = -1.0f;
-    if (Yaw_angle_command > 1.0f) Yaw_angle_command = 1.0f;
-    // Yaw control
-    Yaw_rate_reference = 2.0f * PI * (Yaw_angle_command - Rudder_center);
-
-    if (Control_mode == RATECONTROL) {
-        Roll_rate_reference  = 240 * PI / 180 * Roll_angle_command;
-        Pitch_rate_reference = 240 * PI / 180 * Pitch_angle_command;
-    }
-
-    // flip button check
-    if (Flip_flag == 0 /*&& Throttle_control_mode == 0*/) {
-        Flip_flag = get_flip_button();
-        if (Flip_flag == 1) Mode = FLIP_MODE;
-    }
-}
-#endif
 
 uint8_t auto_landing(void) {
     // Auto Landing
@@ -929,11 +883,7 @@ uint8_t auto_landing(void) {
     // Thrust_command = Thrust_filtered.update(auto_throttle*BATTERY_VOLTAGE, Interval_time);
 
     // Get RPY command
-    // Compensation d'inclinaison pour l'atterrissage (Trim)
-    // Ajustez landing_roll_trim : positif = penche à droite, négatif = penche à gauche
-    float landing_roll_trim = 0.12f; // Augmenté pour compenser davantage (~ +1 degré)
-
-    Roll_angle_command = 0.4 * Stick[AILERON] + landing_roll_trim;
+    Roll_angle_command = 0.4 * Stick[AILERON];
     if (Roll_angle_command < -1.0f) Roll_angle_command = -1.0f;
     if (Roll_angle_command > 1.0f) Roll_angle_command = 1.0f;
     Pitch_angle_command = 0.4 * Stick[ELEVATOR];
@@ -989,8 +939,8 @@ void rate_control(void) {
             z_dot_err      = Z_dot_ref - Alt_velocity;
             Thrust_command = Thrust_filtered.update(
                 (Thrust0 + z_dot_pid.update(z_dot_err, Interval_time)) * BATTERY_VOLTAGE, Interval_time);
-            if (Thrust_command / BATTERY_VOLTAGE > Thrust0 * 1.80f) Thrust_command = BATTERY_VOLTAGE * Thrust0 * 1.80f;
-            if (Thrust_command / BATTERY_VOLTAGE < Thrust0 * 0.50f) Thrust_command = BATTERY_VOLTAGE * Thrust0 * 0.50f;
+            if (Thrust_command / BATTERY_VOLTAGE > Thrust0 * 1.15f) Thrust_command = BATTERY_VOLTAGE * Thrust0 * 1.15f;
+            if (Thrust_command / BATTERY_VOLTAGE < Thrust0 * 0.85f) Thrust_command = BATTERY_VOLTAGE * Thrust0 * 0.85f;
         } else if (Mode == AUTO_LANDING_MODE) {
             z_dot_err      = -0.15 - Alt_velocity;
             Thrust_command = Thrust_filtered.update(
